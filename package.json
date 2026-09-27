@@ -58,7 +58,8 @@
       {
         "provider": "github",
         "owner": "zekstatech",
-        "repo": "flare-nexus-tracker"
+        "repo": "flare-nexus-tracker",
+        "releaseType": "release"
       }
     ]
   },

@@ -58,20 +58,24 @@ npm run dist:linux    # → release/Productivity-App-linux.AppImage
 
 ### Publish (GitHub Releases)
 
-Tag a version and push — CI builds and publishes:
+You do **not** create the release by hand in the GitHub UI for each ship.
+
+1. Bump `"version"` in `package.json` (e.g. `0.1.4`)
+2. Commit + push `main`
+3. Tag and push the same version:
 
 ```bash
 git tag v0.1.4
 git push origin v0.1.4
 ```
 
-Stable download URLs (HRMS install page):
+CI builds mac/win/linux and publishes a **non-draft** Release. When Actions is green:
 
 - https://github.com/zekstatech/flare-nexus-tracker/releases/latest/download/Productivity-App-mac.dmg
 - https://github.com/zekstatech/flare-nexus-tracker/releases/latest/download/Productivity-App-win.exe
 - https://github.com/zekstatech/flare-nexus-tracker/releases/latest/download/Productivity-App-linux.AppImage
 
-Release assets must be publicly readable for `electron-updater` and employee downloads.
+If the repo is **private**, unauthenticated `/latest/download/...` returns **404**. Make the repo (or at least release assets) public for employee downloads and auto-update.
 
 Install UI in HRMS: `/tracker-install`
 
