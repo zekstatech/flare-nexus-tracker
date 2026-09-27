@@ -7,5 +7,3 @@ release/
 *.exe
 *.AppImage
 *.blockmap
-*.yml
-!package.json
