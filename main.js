@@ -21,6 +21,9 @@ const path = require('path');
 
 const AGENT_PORT = Number(process.env.TRACKER_AGENT_PORT || 17345);
 const AGENT_VERSION = require('./package.json').version;
+/** Must match backend PRODUCTIVITY_AGENT_APP_KEY (or its default). */
+const AGENT_APP_KEY =
+  process.env.TRACKER_APP_KEY || 'flare-nexus-tracker';
 const SAMPLE_INTERVAL_MS = 5 * 1000;
 const FLUSH_INTERVAL_MS = 30 * 1000;
 const HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000;
@@ -38,6 +41,8 @@ let tray = null;
 let server = null;
 let isQuitting = false;
 let quitFlushDone = false;
+let allowQuitForUpdate = false;
+let pendingUpdateVersion = null;
 
 /** Only one tracker process — second launch focuses the existing one. */
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -139,6 +144,51 @@ async function postJson(url, token, body) {
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
   return res.json().catch(() => ({}));
+}
+
+/**
+ * Prove this desktop agent is running: call HRMS with user JWT + app key.
+ * Browser check-in requires a fresh agent-ready mark from this call.
+ */
+async function runPreflight({ token, apiBaseUrl }) {
+  if (!token || !apiBaseUrl) {
+    const err = new Error('token and apiBaseUrl are required');
+    err.status = 400;
+    throw err;
+  }
+  const url = apiUrl(apiBaseUrl, '/time-tracking/agent-ready');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      'X-Productivity-Agent-Key': AGENT_APP_KEY,
+    },
+    body: JSON.stringify({
+      version: AGENT_VERSION,
+      appKey: AGENT_APP_KEY,
+    }),
+  });
+  const text = await res.text().catch(() => '');
+  let json = {};
+  try {
+    json = JSON.parse(text || '{}');
+  } catch {
+    json = {};
+  }
+  if (!res.ok) {
+    const err = new Error(
+      json.message || `Agent ready failed (HTTP ${res.status})`
+    );
+    err.status = res.status >= 400 && res.status < 600 ? res.status : 502;
+    err.code = json.code;
+    throw err;
+  }
+  return {
+    ok: true,
+    version: AGENT_VERSION,
+    ...(json.data || {}),
+  };
 }
 
 function minuteKey(date = new Date()) {
@@ -502,6 +552,13 @@ function createLocalServer() {
         return;
       }
 
+      if (req.method === 'POST' && url.startsWith('/preflight')) {
+        const body = await readBody(req);
+        const result = await runPreflight(body);
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
       if (req.method === 'POST' && url.startsWith('/stop')) {
         const result = await stopSession();
         sendJson(res, 200, { success: true, ...result });
@@ -538,10 +595,33 @@ function createLocalServer() {
   });
 }
 
+/**
+ * Install a downloaded update. Must not hit before-quit preventDefault or
+ * electron-updater cancels quitAndInstall (app stays on old version).
+ */
+async function installDownloadedUpdate() {
+  if (activeSession) {
+    try {
+      stopMonitoringTimers();
+      await flushTicks();
+    } catch {
+      // ignore — marker kept so session resumes after relaunch
+    }
+  }
+  allowQuitForUpdate = true;
+  quitFlushDone = true;
+  isQuitting = true;
+  // Defer so dialog/tray handlers finish before quit
+  setImmediate(() => {
+    autoUpdater.quitAndInstall(false, true);
+  });
+}
+
 function setupAutoUpdater() {
   if (!app.isPackaged) return;
 
   autoUpdater.autoDownload = true;
+  // Packaged builds often never quit (no tray Quit) — still useful if OS logs out.
   autoUpdater.autoInstallOnAppQuit = true;
 
   autoUpdater.on('error', (err) => {
@@ -550,6 +630,8 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-downloaded', (info) => {
     const ver = info?.version || 'new';
+    pendingUpdateVersion = ver;
+    refreshTrayMenu();
     dialog
       .showMessageBox({
         type: 'info',
@@ -558,11 +640,12 @@ function setupAutoUpdater() {
         cancelId: 1,
         title: 'Update ready',
         message: `Productivity App ${ver} is ready to install.`,
-        detail: 'Restart to finish the update. Tracking will resume after relaunch if a session is open.',
+        detail:
+          'The app must restart to finish installing.',
       })
       .then(({ response }) => {
         if (response === 0) {
-          autoUpdater.quitAndInstall(false, true);
+          void installDownloadedUpdate();
         }
       })
       .catch(() => {});
@@ -598,6 +681,14 @@ function refreshTrayMenu() {
   ];
 
   if (app.isPackaged) {
+    if (pendingUpdateVersion) {
+      items.push({
+        label: `Restart to install v${pendingUpdateVersion}`,
+        click: () => {
+          void installDownloadedUpdate();
+        },
+      });
+    }
     items.push({
       label: 'Check for updates',
       click: () => {
@@ -611,6 +702,22 @@ function refreshTrayMenu() {
         };
         const onNotAvailable = () => {
           cleanup();
+          if (pendingUpdateVersion) {
+            dialog
+              .showMessageBox({
+                type: 'info',
+                buttons: ['Restart now', 'Later'],
+                defaultId: 0,
+                cancelId: 1,
+                message: 'Update already downloaded',
+                detail: `Version ${pendingUpdateVersion} is ready. Restart to install.`,
+              })
+              .then(({ response }) => {
+                if (response === 0) void installDownloadedUpdate();
+              })
+              .catch(() => {});
+            return;
+          }
           dialog.showMessageBox({
             type: 'info',
             message: 'You are up to date',
@@ -825,6 +932,18 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', (e) => {
+  // quitAndInstall relies on this quit completing — do not cancel it.
+  if (allowQuitForUpdate) {
+    if (server) {
+      try {
+        server.close();
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
+
   if (quitFlushDone) return;
   isQuitting = true;
 

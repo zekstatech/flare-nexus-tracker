@@ -28,7 +28,8 @@ Pairs with the HRMS time-tracking module (`flare-human-nexus` → `plans/time-tr
 |-----------|----------|
 | App not running → Check-in | Blocked — must launch tracker first |
 | App running, browser blocks localhost (Chrome LNA) | Status “Not detected” until user Allows local network for the HRMS site |
-| App running, Ready → Check-in | Creates server session + agent starts Tracking |
+| App running, Ready → Check-in | Agent `/preflight` marks server ready → check-in allowed → session starts |
+| Check-in without agent (API / no install) | Rejected with `AGENT_REQUIRED` when employee has productivity tracking on |
 | Tracking → Check-out | Agent flushes + stops, then attendance check-out |
 | Tray **Quit** while Tracking | **Installed:** no Quit in tray (stays background). **Dev:** confirm + flush; marker kept |
 | Close window / Connected UI | Hides only — app keeps running |
