@@ -1,14 +1,16 @@
 /**
- * Flare Nexus desktop productivity tracker (MVP).
+ * Flare Nexus desktop productivity tracker.
  * Local HTTP on 127.0.0.1:17345 — status / start / stop.
  * Idle detection via Electron powerMonitor.getSystemIdleTime().
- * No screenshots in MVP.
+ * One randomized screenshot per 5–10 minute window while a session is active.
  */
 
 const {
   app,
   BrowserWindow,
   powerMonitor,
+  desktopCapturer,
+  screen,
   Tray,
   Menu,
   nativeImage,
@@ -25,6 +27,9 @@ const SAMPLE_INTERVAL_MS = 5 * 1000;
 const FLUSH_INTERVAL_MS = 30 * 1000;
 const HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const SHOT_WINDOW_MIN_MS = 5 * 60 * 1000;
+const SHOT_WINDOW_MAX_MS = 10 * 60 * 1000;
+const MAX_QUEUED_SHOTS = 80;
 
 /** Packaged installs stay in background — no tray Quit (dev can still quit). */
 function canUserQuit() {
@@ -74,6 +79,12 @@ let lastSampleAt = 0;
 let sampleTimer = null;
 let flushTimer = null;
 let heartbeatTimer = null;
+let shotTimer = null;
+let shotGeneration = 0;
+let flushChain = Promise.resolve();
+
+/** @type {{ id: string, capturedAt: string, activityLevel: 'active' | 'idle' }[]} */
+let pendingShots = [];
 
 function sessionStorePath() {
   return path.join(app.getPath('userData'), 'active-session.json');
@@ -85,6 +96,7 @@ function clearLocalSession(reason) {
   activeSession = null;
   pendingTicks = [];
   currentBucket = null;
+  discardShotQueue();
   saveSessionMarker();
   refreshTrayMenu();
 }
@@ -302,6 +314,232 @@ async function flushTicks() {
   }
 }
 
+function queueDir() {
+  return path.join(app.getPath('userData'), 'screenshot-queue');
+}
+
+function shotPaths(id) {
+  const dir = queueDir();
+  return {
+    full: path.join(dir, `${id}.jpg`),
+    thumb: path.join(dir, `${id}.thumb.jpg`),
+  };
+}
+
+function saveShotManifest() {
+  const dir = queueDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'manifest.json'),
+    JSON.stringify(pendingShots),
+    'utf8'
+  );
+}
+
+function loadShotQueue() {
+  try {
+    const raw = fs.readFileSync(path.join(queueDir(), 'manifest.json'), 'utf8');
+    const rows = JSON.parse(raw);
+    pendingShots = Array.isArray(rows)
+      ? rows.filter((row) => row && row.id && row.capturedAt)
+      : [];
+  } catch {
+    pendingShots = [];
+  }
+}
+
+function deleteShotFiles(id) {
+  const files = shotPaths(id);
+  for (const file of [files.full, files.thumb]) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function discardShotQueue() {
+  pendingShots = [];
+  try {
+    fs.rmSync(queueDir(), { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
+
+function enqueueShot({ id, capturedAt, activityLevel, jpeg, thumb }) {
+  const dir = queueDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const files = shotPaths(id);
+  fs.writeFileSync(files.full, jpeg);
+  fs.writeFileSync(files.thumb, thumb);
+  pendingShots.push({ id, capturedAt, activityLevel });
+  if (pendingShots.length > MAX_QUEUED_SHOTS) {
+    const dropped = pendingShots.splice(0, pendingShots.length - MAX_QUEUED_SHOTS);
+    for (const shot of dropped) deleteShotFiles(shot.id);
+  }
+  saveShotManifest();
+}
+
+async function postForm(url, token, form) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  const text = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const json = JSON.parse(text || '{}');
+  return json.data || {};
+}
+
+async function captureScreenshot() {
+  if (!activeSession) return;
+  const display = screen.getPrimaryDisplay();
+  const scale = display.scaleFactor || 1;
+  const pixelW = Math.round(display.size.width * scale);
+  const pixelH = Math.round(display.size.height * scale);
+  const ratio = Math.min(1, 1440 / Math.max(pixelW, 1));
+  const width = Math.max(2, Math.round(pixelW * ratio));
+  const height = Math.max(2, Math.round(pixelH * ratio));
+
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width, height },
+    fetchWindowIcons: false,
+  });
+  if (!activeSession) return;
+
+  const primaryId = String(display.id);
+  const source =
+    sources.find((item) => String(item.display_id) === primaryId) || sources[0];
+  if (!source || source.thumbnail.isEmpty()) {
+    console.warn('[screenshot] no screen frame — grant Screen Recording permission');
+    return;
+  }
+
+  const jpeg = source.thumbnail.toJPEG(70);
+  if (!jpeg || jpeg.length < 2000) {
+    console.warn('[screenshot] frame too small, skipped');
+    return;
+  }
+  const thumb = source.thumbnail.resize({ width: 320, quality: 'good' }).toJPEG(60);
+  const threshold = activeSession.idleThresholdSec || 300;
+  const { idleSec, state } = readIdle();
+  const activityLevel = isIdleNow(idleSec, state, threshold) ? 'idle' : 'active';
+  const id = crypto.randomUUID();
+  enqueueShot({
+    id,
+    capturedAt: new Date().toISOString(),
+    activityLevel,
+    jpeg,
+    thumb,
+  });
+  console.log(`[screenshot] queued ${activityLevel} ${jpeg.length} bytes`);
+}
+
+function scheduleScreenshot() {
+  if (shotTimer) clearTimeout(shotTimer);
+  shotTimer = null;
+  if (!activeSession) return;
+  const generation = ++shotGeneration;
+  const windowMs =
+    SHOT_WINDOW_MIN_MS +
+    Math.random() * (SHOT_WINDOW_MAX_MS - SHOT_WINDOW_MIN_MS);
+  const delay = Math.floor(Math.random() * windowMs);
+  shotTimer = setTimeout(() => {
+    captureScreenshot()
+      .catch((err) => {
+        console.warn('[screenshot]', err?.message || err);
+      })
+      .finally(() => {
+        if (generation !== shotGeneration || !activeSession) return;
+        const remaining = Math.max(1000, windowMs - delay);
+        shotTimer = setTimeout(() => {
+          if (generation !== shotGeneration || !activeSession) return;
+          flushScreenshots().catch(() => undefined);
+          scheduleScreenshot();
+        }, remaining);
+      });
+  }, delay);
+}
+
+function flushScreenshots() {
+  const run = flushChain.then(() => uploadQueuedScreenshots());
+  flushChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+async function uploadQueuedScreenshots() {
+  if (!activeSession || pendingShots.length === 0) return;
+  const session = activeSession;
+  try {
+    while (activeSession && activeSession.sessionId === session.sessionId && pendingShots.length > 0) {
+      const batch = pendingShots.slice(0, 8);
+      const form = new FormData();
+      const meta = [];
+      const missing = [];
+      for (const shot of batch) {
+        const files = shotPaths(shot.id);
+        if (!fs.existsSync(files.full) || !fs.existsSync(files.thumb)) {
+          missing.push(shot.id);
+          continue;
+        }
+        const full = fs.readFileSync(files.full);
+        const thumb = fs.readFileSync(files.thumb);
+        meta.push({
+          client_id: shot.id,
+          captured_at: shot.capturedAt,
+          activity_level: shot.activityLevel,
+        });
+        form.append(
+          'files',
+          new Blob([full], { type: 'image/jpeg' }),
+          `${shot.id}.jpg`
+        );
+        form.append(
+          'thumbs',
+          new Blob([thumb], { type: 'image/jpeg' }),
+          `${shot.id}.jpg`
+        );
+      }
+      form.append('meta', JSON.stringify(meta));
+
+      /** @type {Set<string>} */
+      let drop = new Set(missing);
+      if (meta.length > 0) {
+        const result = await postForm(
+          apiUrl(
+            session.apiBaseUrl,
+            `/time-tracking/sessions/${session.sessionId}/screenshots`
+          ),
+          session.token,
+          form
+        );
+        for (const id of result.stored || []) drop.add(id);
+        for (const id of result.rejected || []) drop.add(id);
+        if (!activeSession || activeSession.sessionId !== session.sessionId) return;
+      }
+      if (drop.size === 0) break;
+      pendingShots = pendingShots.filter((shot) => !drop.has(shot.id));
+      for (const id of drop) deleteShotFiles(id);
+      saveShotManifest();
+    }
+  } catch (err) {
+    if (isSessionGoneError(err)) {
+      clearLocalSession('Screenshot upload: session closed on server');
+      return;
+    }
+    console.error('flushScreenshots failed, will retry:', err.message);
+  }
+}
+
 async function sendHeartbeat() {
   if (!activeSession) return;
   try {
@@ -326,20 +564,25 @@ function startMonitoring() {
   stopMonitoringTimers();
   currentBucket = null;
   lastSampleAt = Date.now();
+  loadShotQueue();
   sampleActivity();
+  scheduleScreenshot();
   sampleTimer = setInterval(sampleActivity, SAMPLE_INTERVAL_MS);
   flushTimer = setInterval(() => {
     flushTicks().catch(() => undefined);
+    flushScreenshots().catch(() => undefined);
   }, FLUSH_INTERVAL_MS);
   heartbeatTimer = setInterval(() => {
     sendHeartbeat().catch(() => undefined);
   }, HEARTBEAT_INTERVAL_MS);
   sendHeartbeat().catch(() => undefined);
+  flushScreenshots().catch(() => undefined);
 
   const onResume = () => {
     console.log('[power] resume/unlock — sampling after possible sleep');
     sampleActivity();
     flushTicks().catch(() => undefined);
+    flushScreenshots().catch(() => undefined);
   };
   powerMonitor.removeAllListeners('resume');
   powerMonitor.removeAllListeners('unlock-screen');
@@ -352,9 +595,12 @@ function stopMonitoringTimers() {
   if (sampleTimer) clearInterval(sampleTimer);
   if (flushTimer) clearInterval(flushTimer);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (shotTimer) clearTimeout(shotTimer);
+  shotGeneration += 1;
   sampleTimer = null;
   flushTimer = null;
   heartbeatTimer = null;
+  shotTimer = null;
   flushCurrentBucket();
 }
 
@@ -386,9 +632,11 @@ async function startSession(payload) {
   // Different session still marked active — flush/clear, then start the new one
   if (activeSession) {
     await flushTicks().catch(() => undefined);
+    await flushScreenshots().catch(() => undefined);
     stopMonitoringTimers();
     activeSession = null;
     pendingTicks = [];
+    discardShotQueue();
     saveSessionMarker();
   }
 
@@ -404,7 +652,8 @@ async function stopSession() {
     return { stopped: false, reason: 'no_active_session' };
   }
   await flushTicks();
-  clearLocalSession();
+  await flushScreenshots();
+  if (activeSession) clearLocalSession();
   return { stopped: true };
 }
 
@@ -429,13 +678,22 @@ async function validateResumedSession() {
   }
 }
 
+/** CORS + Private/Local Network Access so HTTPS HRMS can reach 127.0.0.1 */
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Required for Chrome PNA preflights (and harmless under LNA).
+    'Access-Control-Allow-Private-Network': 'true',
+  };
+}
+
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    ...corsHeaders(),
     'Content-Length': Buffer.byteLength(payload),
   });
   res.end(payload);
@@ -461,11 +719,7 @@ function readBody(req) {
 function createLocalServer() {
   server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      });
+      res.writeHead(204, corsHeaders());
       res.end();
       return;
     }
@@ -510,6 +764,22 @@ function createLocalServer() {
         message: err.message || 'Internal error',
       });
     }
+  });
+
+  server.on('error', (err) => {
+    console.error('App agent listen failed:', err.message);
+    const detail =
+      err.code === 'EADDRINUSE'
+        ? `Port ${AGENT_PORT} is already in use. Quit any other Productivity App / old tracker, then relaunch.`
+        : err.message;
+    dialog
+      .showMessageBox({
+        type: 'error',
+        title: 'Productivity App',
+        message: 'Local agent could not start',
+        detail,
+      })
+      .catch(() => undefined);
   });
 
   server.listen(AGENT_PORT, '127.0.0.1', () => {
@@ -709,17 +979,18 @@ function connectedPageHtml() {
     background: #4ade80;
     cursor: default;
   }
-  p { margin: 0; font-size: 12px; color: #94a3b8; }
+  p { margin: 0; font-size: 12px; color: #94a3b8; text-align: center; max-width: 200px; }
 </style></head>
 <body>
   <button type="button" disabled>Connected</button>
+  <p>Keep this app running. In Chrome, allow local network access when HRMS asks.</p>
 </body></html>`;
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 220,
-    height: 120,
+    width: 260,
+    height: 160,
     show: false,
     resizable: false,
     maximizable: false,
@@ -813,6 +1084,7 @@ app.on('before-quit', (e) => {
       try {
         stopMonitoringTimers();
         await flushTicks();
+        await flushScreenshots();
       } catch {
         // ignore
       } finally {

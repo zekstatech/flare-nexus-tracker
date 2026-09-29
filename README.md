@@ -17,16 +17,18 @@ Pairs with the HRMS time-tracking module (`flare-human-nexus` → `plans/time-tr
 - **Auto-update** via GitHub Releases (`electron-updater`) when packaged
 - Stays **dormant** until the HRMS web app starts a session after check-in
 - Per-minute active/idle buckets via Electron `powerMonitor.getSystemIdleTime()`
-- Batch upload + heartbeat to `/api/time-tracking/...`
+- One screenshot at a random time inside each **5–10 minute** window, tagged active or idle
+- Batch upload of activity ticks, screenshots, and heartbeat to `/api/time-tracking/...`
+- Screenshots queue on disk while offline and flush when the API is reachable
 - Persists an active-session marker and **auto-resumes** after reboot / relaunch
 - Validates resumed session against the API (clears marker if server already closed it)
-- No screenshots in MVP
 
 ## Use cases (installed app)
 
 | Situation | Behavior |
 |-----------|----------|
 | App not running → Check-in | Blocked — must launch tracker first |
+| App running, browser blocks localhost (Chrome LNA) | Status “Not detected” until user Allows local network for the HRMS site |
 | App running, Ready → Check-in | Creates server session + agent starts Tracking |
 | Tracking → Check-out | Agent flushes + stops, then attendance check-out |
 | Tray **Quit** while Tracking | **Installed:** no Quit in tray (stays background). **Dev:** confirm + flush; marker kept |
@@ -76,6 +78,18 @@ CI builds mac/win/linux and publishes a **non-draft** Release. When Actions is g
 - https://github.com/zekstatech/flare-nexus-tracker/releases/latest/download/Productivity-App-linux.AppImage
 
 If the repo is **private**, unauthenticated `/latest/download/...` returns **404**. Make the repo (or at least release assets) public for employee downloads and auto-update.
+
+### macOS “damaged and can’t be opened”
+
+Current CI builds are **unsigned** (`identity: null`). After downloading from the web, Gatekeeper may refuse to open the app. Internal workaround:
+
+```bash
+# After copying the app into Applications:
+xattr -cr "/Applications/Productivity App.app"
+open "/Applications/Productivity App.app"
+```
+
+Proper fix later: Apple Developer ID signing + notarization in CI.
 
 Install UI in HRMS: `/tracker-install`
 
