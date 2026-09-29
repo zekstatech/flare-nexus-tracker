@@ -429,13 +429,22 @@ async function validateResumedSession() {
   }
 }
 
+/** CORS + Private/Local Network Access so HTTPS HRMS can reach 127.0.0.1 */
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Required for Chrome PNA preflights (and harmless under LNA).
+    'Access-Control-Allow-Private-Network': 'true',
+  };
+}
+
 function sendJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    ...corsHeaders(),
     'Content-Length': Buffer.byteLength(payload),
   });
   res.end(payload);
@@ -461,11 +470,7 @@ function readBody(req) {
 function createLocalServer() {
   server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      });
+      res.writeHead(204, corsHeaders());
       res.end();
       return;
     }
@@ -510,6 +515,22 @@ function createLocalServer() {
         message: err.message || 'Internal error',
       });
     }
+  });
+
+  server.on('error', (err) => {
+    console.error('App agent listen failed:', err.message);
+    const detail =
+      err.code === 'EADDRINUSE'
+        ? `Port ${AGENT_PORT} is already in use. Quit any other Productivity App / old tracker, then relaunch.`
+        : err.message;
+    dialog
+      .showMessageBox({
+        type: 'error',
+        title: 'Productivity App',
+        message: 'Local agent could not start',
+        detail,
+      })
+      .catch(() => undefined);
   });
 
   server.listen(AGENT_PORT, '127.0.0.1', () => {
@@ -709,17 +730,18 @@ function connectedPageHtml() {
     background: #4ade80;
     cursor: default;
   }
-  p { margin: 0; font-size: 12px; color: #94a3b8; }
+  p { margin: 0; font-size: 12px; color: #94a3b8; text-align: center; max-width: 200px; }
 </style></head>
 <body>
   <button type="button" disabled>Connected</button>
+  <p>Keep this app running. In Chrome, allow local network access when HRMS asks.</p>
 </body></html>`;
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 220,
-    height: 120,
+    width: 260,
+    height: 160,
     show: false,
     resizable: false,
     maximizable: false,

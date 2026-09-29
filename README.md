@@ -27,6 +27,7 @@ Pairs with the HRMS time-tracking module (`flare-human-nexus` → `plans/time-tr
 | Situation | Behavior |
 |-----------|----------|
 | App not running → Check-in | Blocked — must launch tracker first |
+| App running, browser blocks localhost (Chrome LNA) | Status “Not detected” until user Allows local network for the HRMS site |
 | App running, Ready → Check-in | Creates server session + agent starts Tracking |
 | Tracking → Check-out | Agent flushes + stops, then attendance check-out |
 | Tray **Quit** while Tracking | **Installed:** no Quit in tray (stays background). **Dev:** confirm + flush; marker kept |
