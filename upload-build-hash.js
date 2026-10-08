@@ -13,17 +13,66 @@ function request(options, body) {
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`HTTP ${res.statusCode}: ${text.slice(0, 300)}`));
-          return;
+        let json = null;
+        if (text) {
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = null;
+          }
         }
-        resolve(text ? JSON.parse(text) : null);
+        resolve({ status: res.statusCode, json, text });
       });
     });
     req.on('error', reject);
     if (body) req.end(body);
     else req.end();
   });
+}
+
+function assertOk(res) {
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`HTTP ${res.status}: ${(res.text || '').slice(0, 300)}`);
+  }
+  return res.json;
+}
+
+async function releaseForTag(repo, tag, headers) {
+  const byTag = await request({
+    host: 'api.github.com',
+    path: `/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`,
+    headers,
+  });
+  if (byTag.status === 200) return byTag.json;
+  if (byTag.status !== 404) assertOk(byTag);
+
+  const listed = assertOk(await request({
+    host: 'api.github.com',
+    path: `/repos/${repo}/releases?per_page=100`,
+    headers,
+  }));
+  const found = (listed || []).find((item) => item.tag_name === tag);
+  if (found) return found;
+
+  const created = await request(
+    {
+      host: 'api.github.com',
+      method: 'POST',
+      path: `/repos/${repo}/releases`,
+      headers: { ...headers, 'Content-Type': 'application/json' },
+    },
+    JSON.stringify({ tag_name: tag, name: tag, draft: false })
+  );
+  if (created.status === 422) {
+    const again = assertOk(await request({
+      host: 'api.github.com',
+      path: `/repos/${repo}/releases?per_page=100`,
+      headers,
+    }));
+    const retry = (again || []).find((item) => item.tag_name === tag);
+    if (retry) return retry;
+  }
+  return assertOk(created);
 }
 
 async function main() {
@@ -40,26 +89,22 @@ async function main() {
     Accept: 'application/vnd.github+json',
     'User-Agent': 'flare-nexus-tracker-release',
   };
-  const release = await request({
-    host: 'api.github.com',
-    path: `/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`,
-    headers,
-  });
-  const assets = await request({
+  const release = await releaseForTag(repo, tag, headers);
+  const assets = assertOk(await request({
     host: 'api.github.com',
     path: `/repos/${repo}/releases/${release.id}/assets`,
     headers,
-  });
+  }));
   for (const asset of assets || []) {
     if (asset.name !== name) continue;
-    await request({
+    assertOk(await request({
       host: 'api.github.com',
       method: 'DELETE',
       path: `/repos/${repo}/releases/assets/${asset.id}`,
       headers,
-    });
+    }));
   }
-  await request(
+  assertOk(await request(
     {
       host: 'uploads.github.com',
       method: 'POST',
@@ -71,7 +116,7 @@ async function main() {
       },
     },
     file
-  );
+  ));
   console.log(`Uploaded ${name} (${file.length} bytes) to ${tag}`);
 }
 

@@ -12,7 +12,7 @@ function findResourceDirs(dir, found) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (!entry.isDirectory()) continue;
-    if (entry.name === 'resources' && fs.existsSync(path.join(full, 'app.asar'))) {
+    if (entry.name.toLowerCase() === 'resources' && fs.existsSync(path.join(full, 'app.asar'))) {
       found.push(full);
       continue;
     }
@@ -26,6 +26,18 @@ async function main() {
   findResourceDirs(root, dirs);
   if (dirs.length === 0) {
     console.error(`No packaged Resources directory under ${root}`);
+    const shown = [];
+    const walk = (dir, depth) => {
+      if (depth > 4 || shown.length >= 30 || !fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name === 'Frameworks' || entry.name.endsWith('.framework')) continue;
+        shown.push(path.relative(root, path.join(dir, entry.name)));
+        walk(path.join(dir, entry.name), depth + 1);
+      }
+    };
+    walk(root, 0);
+    if (shown.length) console.error(shown.join('\n'));
     process.exit(1);
   }
   const lines = [];
@@ -33,6 +45,7 @@ async function main() {
     const hash = await hashResources(dir);
     const line = `${hash}  ${path.relative(__dirname, dir)}`;
     lines.push(line);
+    console.log(line);
   }
   const out = process.argv[2];
   if (out) fs.writeFileSync(out, `${lines.join('\n')}\n`);
