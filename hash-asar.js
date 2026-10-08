@@ -28,10 +28,14 @@ async function main() {
     console.error(`No packaged Resources directory under ${root}`);
     process.exit(1);
   }
+  const lines = [];
   for (const dir of dirs) {
     const hash = await hashResources(dir);
-    console.log(`${hash}  ${path.relative(__dirname, dir)}`);
+    const line = `${hash}  ${path.relative(__dirname, dir)}`;
+    lines.push(line);
   }
+  const out = process.argv[2];
+  if (out) fs.writeFileSync(out, `${lines.join('\n')}\n`);
 }
 
 main().catch((err) => {
