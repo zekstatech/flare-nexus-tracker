@@ -36,3 +36,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder ${{ matrix.args }} --publish always
+
+      - name: Hash app.asar and native addons
+        run: node hash-asar.js | tee "build-${{ runner.os }}.sha256"
+
+      - name: Publish build hash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" "build-${{ runner.os }}.sha256" --clobber

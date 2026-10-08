@@ -1,6 +1,6 @@
 {
   "name": "flare-nexus-tracker",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Flare desktop productivity app",
   "main": "main.js",
   "private": true,
@@ -10,6 +10,7 @@
     "url": "https://github.com/zekstatech/flare-nexus-tracker.git"
   },
   "scripts": {
+    "postinstall": "electron-builder install-app-deps",
     "start": "electron .",
     "dev": "electron .",
     "dist": "electron-builder --mac --win --linux",
@@ -25,8 +26,15 @@
     "directories": {
       "output": "release"
     },
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "npmRebuild": true,
     "files": [
       "main.js",
+      "ledger.js",
+      "buildHash.js",
       "package.json"
     ],
     "mac": {
@@ -64,6 +72,7 @@
     ]
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
     "electron-updater": "^6.3.9"
   },
   "devDependencies": {
