@@ -6,8 +6,17 @@
  * digest for the same bytes.
  */
 const crypto = require('crypto');
-const fs = require('fs');
 const path = require('path');
+// Electron patches fs so app.asar is an archive, not a file. Reading it
+// that way throws "ENOENT, … not found in …/app.asar" during check-in.
+// original-fs is the real filesystem. Plain Node (the release hash script)
+// does not have that module.
+let fs;
+try {
+  fs = require('original-fs');
+} catch {
+  fs = require('fs');
+}
 
 function relativePosix(root, file) {
   return path.relative(root, file).split(path.sep).join('/');
