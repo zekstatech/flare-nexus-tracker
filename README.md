@@ -18,6 +18,8 @@ Pairs with the HRMS time-tracking module (`flare-human-nexus` → `plans/time-tr
 - Stays **dormant** until the HRMS web app starts a session after check-in
 - Per-minute active/idle buckets via Electron `powerMonitor.getSystemIdleTime()`
 - Batch upload + heartbeat to `/api/time-tracking/...`
+- JWT refresh (`POST /auth/refresh`) hourly + one retry on 401 so mid-day uploads keep working
+- Sleep/wake clock hold always releases (15s timeout); unlock-screen does not stall recording
 - Persists an active-session marker and **auto-resumes** after reboot / relaunch
 - Validates resumed session against the API (clears marker if server already closed it)
 - No screenshots in MVP

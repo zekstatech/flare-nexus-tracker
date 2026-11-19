@@ -64,9 +64,12 @@ const TICK_MS = 1000;
 const SLEEP_GAP_MS = 90 * 1000;
 const FLUSH_INTERVAL_MS = 30 * 1000;
 const HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000;
+const TOKEN_REFRESH_MS = 60 * 60 * 1000;
 const ONLINE_PROBE_MS = 30 * 1000;
 const UPLOAD_CHUNK = 120;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+/** Never leave the ticker blocked waiting on the API. */
+const CLOCK_HOLD_MAX_MS = 15 * 1000;
 
 let buildHashPromise = null;
 
@@ -136,6 +139,7 @@ let lastTickAt = 0;
 let lastFlushAt = 0;
 let lastHeartbeatAt = 0;
 let lastProbeAt = 0;
+let lastTokenRefreshAt = 0;
 /** True after a transport failure. Tracking still writes the ledger. */
 let cloudOffline = false;
 
@@ -239,6 +243,11 @@ function clearLocalSession(reason) {
 function isSessionGoneError(err) {
   const msg = String(err?.message || '');
   return msg.includes('HTTP 404') || msg.includes('HTTP 409');
+}
+
+function isUnauthorizedError(err) {
+  if (Number(err?.status) === 401) return true;
+  return String(err?.message || '').includes('HTTP 401');
 }
 
 function saveSessionMarker() {
@@ -445,7 +454,7 @@ function importLegacyFiles() {
     sessionId: String(marker.sessionId),
     token: String(marker.token),
     apiBaseUrl: String(marker.apiBaseUrl),
-    idleThresholdSec: Math.max(60, Number(marker.idleThresholdSec) || 300),
+    idleThresholdSec: Math.max(60, Number(marker.idleThresholdSec) || 600),
   };
   ledger.saveSession(activeSession);
   try {
@@ -584,6 +593,7 @@ let clockAnchorMs = 0;
 let clockAnchorHr = 0n;
 /** While true, the ticker must not seal or write a minute. */
 let clockWritesBlocked = false;
+let clockHoldTimer = null;
 
 function anchorTrustedClock(serverNowMs) {
   const ms = Number(serverNowMs);
@@ -593,13 +603,40 @@ function anchorTrustedClock(serverNowMs) {
   return true;
 }
 
+/**
+ * Prefer the last server anchor. If none exists yet (resume / API down),
+ * fall back to local time so we keep writing minutes instead of stalling.
+ */
+function ensureRecordingClock() {
+  if (clockAnchorMs) return true;
+  console.warn('[clock] no server anchor yet — using local clock so tracking continues');
+  return anchorTrustedClock(Date.now());
+}
+
 function trustedNowMs() {
   if (!clockAnchorMs) return null;
   const elapsedMs = Number((process.hrtime.bigint() - clockAnchorHr) / 1_000_000n);
   return clockAnchorMs + elapsedMs;
 }
 
+function beginClockHold() {
+  clockWritesBlocked = true;
+  if (clockHoldTimer) clearTimeout(clockHoldTimer);
+  clockHoldTimer = setTimeout(() => {
+    clockHoldTimer = null;
+    if (!clockWritesBlocked) return;
+    console.warn('[clock] hold timed out — resuming recording');
+    ensureRecordingClock();
+    releaseClockHold();
+  }, CLOCK_HOLD_MAX_MS);
+}
+
 function releaseClockHold() {
+  if (clockHoldTimer) {
+    clearTimeout(clockHoldTimer);
+    clockHoldTimer = null;
+  }
+  ensureRecordingClock();
   const now = trustedNowMs();
   if (now == null) return;
   clockWritesBlocked = false;
@@ -637,7 +674,7 @@ function readIdle() {
     console.warn('getSystemIdleTime failed:', err.message);
   }
   try {
-    const threshold = activeSession?.idleThresholdSec || 300;
+    const threshold = activeSession?.idleThresholdSec || 600;
     state = powerMonitor.getSystemIdleState(threshold) || 'unknown';
   } catch (err) {
     console.warn('getSystemIdleState failed:', err.message);
@@ -653,7 +690,12 @@ function isIdleNow(idleSec, state, thresholdSec) {
 }
 
 function minuteIsActive(bucket) {
-  return bucket.activeSeconds > 0;
+  // Any non-idle second, or observed input in the minute, counts as active.
+  return (
+    bucket.activeSeconds > 0 ||
+    (bucket.mouseEvents || 0) > 0 ||
+    (bucket.keyEvents || 0) > 0
+  );
 }
 
 function pushCap(list, value, max) {
@@ -836,7 +878,7 @@ function backfillIdleGap(fromMs, toMs) {
 }
 
 function isUserIdle() {
-  const threshold = activeSession?.idleThresholdSec || 300;
+  const threshold = activeSession?.idleThresholdSec || 600;
   const { idleSec, state } = readIdle();
   return isIdleNow(idleSec, state, threshold);
 }
@@ -868,6 +910,7 @@ function observeSecond(atMs, idle) {
 function onSecondTick() {
   if (!activeSession || clockWritesBlocked) return;
 
+  ensureRecordingClock();
   const now = trustedNowMs();
   if (now == null) return;
   if (!lastTickAt || now < lastTickAt) lastTickAt = now;
@@ -875,7 +918,11 @@ function onSecondTick() {
   const gap = now - lastTickAt;
   if (gap > SLEEP_GAP_MS) {
     flushCurrentBucket();
-    backfillIdleGap(lastTickAt, now);
+    // Only backfill a sleep gap when we already had a tick timeline.
+    // A zero lastTickAt after resume must not invent hours of idle.
+    if (lastTickAt > 0) {
+      backfillIdleGap(lastTickAt, now);
+    }
     lastTickAt = now;
     observeSecond(now, isUserIdle());
   } else {
@@ -892,6 +939,13 @@ function onSecondTick() {
       probeCloud().catch(() => undefined);
     }
   } else {
+    if (
+      !lastTokenRefreshAt ||
+      now - lastTokenRefreshAt >= TOKEN_REFRESH_MS
+    ) {
+      lastTokenRefreshAt = now;
+      refreshSessionToken().catch(() => undefined);
+    }
     if (!lastFlushAt || now - lastFlushAt >= FLUSH_INTERVAL_MS) {
       lastFlushAt = now;
       flushTicks().catch(() => undefined);
@@ -931,6 +985,43 @@ async function flushTicks() {
     flushInFlight = null;
   });
   return flushInFlight;
+}
+
+async function refreshSessionToken() {
+  if (!activeSession || cloudOffline) return false;
+  try {
+    const response = await postJson(
+      apiUrl(activeSession.apiBaseUrl, '/auth/refresh'),
+      activeSession.token,
+      {}
+    );
+    const next = response?.data?.token;
+    if (typeof next !== 'string' || !next) return false;
+    activeSession.token = next;
+    saveSessionMarker();
+    lastTokenRefreshAt = trustedNowMs() || Date.now();
+    console.log('[auth] session token refreshed');
+    return true;
+  } catch (err) {
+    if (isNetworkError(err)) {
+      markOffline(err);
+      return false;
+    }
+    console.warn('[auth] token refresh failed:', err.message);
+    return false;
+  }
+}
+
+/** Run an authenticated API call; refresh JWT once on 401 and retry. */
+async function withAuthRetry(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isUnauthorizedError(err)) throw err;
+    const refreshed = await refreshSessionToken();
+    if (!refreshed) throw err;
+    return fn();
+  }
 }
 
 async function uploadLedgerMinutes() {
@@ -988,18 +1079,21 @@ async function uploadLedgerMinutes() {
     }
     let response;
     try {
-      response = await postJson(
-        apiUrl(
-          activeSession.apiBaseUrl,
-          `/time-tracking/sessions/${sessionId}/activity-ticks`
-        ),
-        activeSession.token,
-        {
-          ticks,
-          machineId,
-          signature,
-          buildHash: await getBuildHash(),
-        }
+      const buildHash = await getBuildHash();
+      response = await withAuthRetry(() =>
+        postJson(
+          apiUrl(
+            activeSession.apiBaseUrl,
+            `/time-tracking/sessions/${sessionId}/activity-ticks`
+          ),
+          activeSession.token,
+          {
+            ticks,
+            machineId,
+            signature,
+            buildHash,
+          }
+        )
       );
     } catch (err) {
       if (isNetworkError(err)) {
@@ -1030,27 +1124,31 @@ async function uploadLedgerMinutes() {
 }
 
 async function sendHeartbeat() {
-  if (!activeSession || cloudOffline) return;
+  if (!activeSession || cloudOffline) return false;
   try {
-    const response = await postJson(
-      apiUrl(
-        activeSession.apiBaseUrl,
-        `/time-tracking/sessions/${activeSession.sessionId}/heartbeat`
-      ),
-      activeSession.token,
-      { buildHash: await getBuildHash() }
+    const buildHash = await getBuildHash();
+    const response = await withAuthRetry(() =>
+      postJson(
+        apiUrl(
+          activeSession.apiBaseUrl,
+          `/time-tracking/sessions/${activeSession.sessionId}/heartbeat`
+        ),
+        activeSession.token,
+        { buildHash }
+      )
     );
     return anchorTrustedClock(response?.data?.serverNow);
   } catch (err) {
     if (isNetworkError(err)) {
       markOffline(err);
-      return;
+      return false;
     }
     if (isSessionGoneError(err)) {
       clearLocalSession('Heartbeat: session closed on server');
-      return;
+      return false;
     }
     console.error('heartbeat failed:', err.message);
+    return false;
   }
 }
 
@@ -1064,27 +1162,37 @@ async function probeCloud() {
   await flushTicks();
   if (cloudOffline || !activeSession) return;
   const anchored = await sendHeartbeat();
-  if (!anchored || cloudOffline || !activeSession) return;
+  // Always resume writing. A missed heartbeat must not freeze the day.
   releaseClockHold();
-  console.log('[offline] connection restored, local cache synced');
+  if (anchored) {
+    console.log('[offline] connection restored, local cache synced');
+  } else {
+    console.warn('[offline] reconnected but heartbeat missed — recording continues');
+  }
 }
 
 function startMonitoring() {
   stopMonitoringTimers();
   monitoring = true;
   currentBucket = null;
+  if (!clockWritesBlocked) ensureRecordingClock();
   const now = clockWritesBlocked ? 0 : trustedNowMs() || 0;
   lastTickAt = now;
   lastFlushAt = now;
   lastHeartbeatAt = now;
+  lastTokenRefreshAt = now;
   if (now) observeSecond(now, isUserIdle());
-  if (!clockWritesBlocked) sendHeartbeat().catch(() => undefined);
+  if (!clockWritesBlocked) {
+    sendHeartbeat().catch(() => undefined);
+    refreshSessionToken().catch(() => undefined);
+  }
   startInputPoll();
   armTicker();
   preventAppNap();
 
+  // Sleep/wake only — screen unlock is frequent and must not stall the ticker.
   const onResume = () => {
-    console.log('[power] resume/unlock — discard open minute and sync server time');
+    console.log('[power] resume — discard open minute and sync server time');
     syncClockAfterWake().catch((err) => {
       console.warn('[power] wake sync failed:', err.message);
     });
@@ -1092,7 +1200,6 @@ function startMonitoring() {
   powerMonitor.removeAllListeners('resume');
   powerMonitor.removeAllListeners('unlock-screen');
   powerMonitor.on('resume', onResume);
-  powerMonitor.on('unlock-screen', onResume);
   refreshTrayMenu();
 }
 
@@ -1140,7 +1247,7 @@ async function startSession(payload) {
     apiBaseUrl: String(payload.apiBaseUrl),
     idleThresholdSec: Math.max(
       60,
-      Number(payload.idleThresholdSec) || 300
+      Number(payload.idleThresholdSec) || 600
     ),
     signingKey: signingKey.toLowerCase(),
   };
@@ -1182,17 +1289,23 @@ let wakeSync = null;
 
 /**
  * Lid open: drop the unfinished minute, push minutes sealed before sleep,
- * then re-anchor. The ticker stays blocked until serverNow is applied.
+ * then re-anchor. Recording resumes even if the heartbeat fails (timeout).
  */
 async function syncClockAfterWake() {
   if (wakeSync) return wakeSync;
   wakeSync = (async () => {
-    clockWritesBlocked = true;
+    beginClockHold();
     discardOpenMinute();
     lastTickAt = 0;
-    if (!cloudOffline) await flushTicks();
-    if (cloudOffline || !activeSession) return;
-    if (await sendHeartbeat()) releaseClockHold();
+    try {
+      if (!cloudOffline) await flushTicks();
+      if (activeSession && !cloudOffline) {
+        await sendHeartbeat();
+      }
+    } finally {
+      // Always unblock. Prefer server clock when heartbeat worked; else local.
+      releaseClockHold();
+    }
   })().finally(() => {
     wakeSync = null;
   });
@@ -1202,29 +1315,32 @@ async function syncClockAfterWake() {
 /** After relaunch: keep the signing key, upload the old queue, then anchor. */
 async function validateResumedSession() {
   if (!activeSession) return;
-  clockWritesBlocked = true;
+  beginClockHold();
   try {
     await flushTicks();
-    if (cloudOffline || !activeSession) return;
-    const response = await postJson(
-      apiUrl(
-        activeSession.apiBaseUrl,
-        `/time-tracking/sessions/${activeSession.sessionId}/heartbeat`
-      ),
-      activeSession.token,
-      { buildHash: await getBuildHash() }
-    );
-    if (anchorTrustedClock(response?.data?.serverNow)) releaseClockHold();
+    if (!activeSession) return;
+    if (cloudOffline) {
+      releaseClockHold();
+      return;
+    }
+    const ok = await sendHeartbeat();
+    if (!ok) await refreshSessionToken();
   } catch (err) {
     if (isNetworkError(err)) {
       markOffline(err);
-      return;
-    }
-    if (isSessionGoneError(err)) {
+    } else if (isSessionGoneError(err)) {
       clearLocalSession('Resumed session is no longer active on server');
     } else {
       console.warn('validateResumedSession:', err.message);
     }
+  } finally {
+    // Always clear the hold (session may have been cleared above).
+    if (clockHoldTimer) {
+      clearTimeout(clockHoldTimer);
+      clockHoldTimer = null;
+    }
+    clockWritesBlocked = false;
+    if (activeSession) releaseClockHold();
   }
 }
 
@@ -1711,12 +1827,12 @@ app.whenReady().then(async () => {
       apiBaseUrl: String(marker.apiBaseUrl),
       idleThresholdSec: Math.max(
         60,
-        Number(marker.idleThresholdSec) || 300
+        Number(marker.idleThresholdSec) || 600
       ),
       signingKey: String(marker.signingKey || ''),
     };
     console.log('Resuming active session', activeSession.sessionId);
-    clockWritesBlocked = true;
+    beginClockHold();
     startMonitoring();
     await validateResumedSession();
   } else {
