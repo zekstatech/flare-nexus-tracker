@@ -22,7 +22,8 @@
  * POST /start, /stop, and /preflight require a single-use handshake
  * token signed by the HRMS API. /status stays open for the install check.
  * The window is static — hidden renderers throttle timers.
- * No screenshots in MVP.
+ * Phase 2: optional active-only screenshots (org toggle), queued offline,
+ * uploaded as multipart JPEG + thumbnail.
  */
 
 const {
@@ -34,6 +35,7 @@ const {
   Tray,
   Menu,
   nativeImage,
+  desktopCapturer,
   dialog,
   safeStorage,
 } = require('electron');
@@ -70,6 +72,8 @@ const UPLOAD_CHUNK = 120;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 /** Never leave the ticker blocked waiting on the API. */
 const CLOCK_HOLD_MAX_MS = 15 * 1000;
+/** One random capture inside each 10-minute window when screenshots are on. */
+const SCREENSHOT_WINDOW_MS = 10 * 60 * 1000;
 
 let buildHashPromise = null;
 
@@ -120,9 +124,13 @@ if (!gotSingleInstanceLock) {
  *   token: string,
  *   apiBaseUrl: string,
  *   idleThresholdSec: number,
- *   signingKey: string
+ *   signingKey: string,
+ *   screenshotsEnabled: boolean
  * }} */
 let activeSession = null;
+/** Next wall time (trusted clock) to attempt a screenshot. */
+let nextScreenshotAt = 0;
+let screenshotCaptureInFlight = false;
 
 /** SQLite ledger opened once app userData is available. */
 let ledger = null;
@@ -227,14 +235,41 @@ function legacyQueuePath() {
   return path.join(app.getPath('userData'), 'activity-queue.json');
 }
 
+function screenshotDir() {
+  return path.join(app.getPath('userData'), 'screenshot-queue');
+}
+
+function ensureScreenshotDir() {
+  const dir = screenshotDir();
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function clearLocalSession(reason) {
   if (reason) console.warn('[session]', reason);
   const sessionId = activeSession?.sessionId;
   stopMonitoringTimers();
   activeSession = null;
   currentBucket = null;
+  nextScreenshotAt = 0;
   if (ledger) {
-    if (sessionId) ledger.clearMinutes(sessionId);
+    if (sessionId) {
+      const shots = ledger.listScreenshots(sessionId) || [];
+      for (const shot of shots) {
+        try {
+          if (shot.imagePath) fs.unlinkSync(shot.imagePath);
+        } catch {
+          // ignore
+        }
+        try {
+          if (shot.thumbPath) fs.unlinkSync(shot.thumbPath);
+        } catch {
+          // ignore
+        }
+      }
+      ledger.clearScreenshots(sessionId);
+      ledger.clearMinutes(sessionId);
+    }
     ledger.clearSession();
   }
   refreshTrayMenu();
@@ -385,6 +420,27 @@ function sessionKeyBuffer(signingKey) {
   const hex = String(signingKey || '');
   if (!/^[0-9a-f]{64}$/i.test(hex)) return null;
   return Buffer.from(hex, 'hex');
+}
+
+function canonicalScreenshot(sessionId, machineId, meta) {
+  return JSON.stringify({
+    v: 1,
+    sessionId: String(sessionId),
+    machineId: String(machineId),
+    captured_at: String(meta.captured_at || ''),
+    activity_level: String(meta.activity_level || 'active'),
+    image_sha256: String(meta.image_sha256 || ''),
+    thumb_sha256: String(meta.thumb_sha256 || ''),
+  });
+}
+
+function signScreenshot(sessionId, machineId, meta, signingKey) {
+  const key = sessionKeyBuffer(signingKey);
+  if (!key) return '';
+  return crypto
+    .createHmac('sha256', key)
+    .update(canonicalScreenshot(sessionId, machineId, meta))
+    .digest('hex');
 }
 
 function signActivity(sessionId, machineId, ticks, signingKey) {
@@ -545,6 +601,78 @@ function postJson(urlString, token, body, extraHeaders) {
       }
     );
     req.setTimeout(20000, () => {
+      req.destroy(new Error('request timeout'));
+    });
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+function postMultipart(urlString, token, fields, files) {
+  const boundary = `----flare${crypto.randomBytes(12).toString('hex')}`;
+  const chunks = [];
+  for (const [name, value] of Object.entries(fields || {})) {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+        'utf8'
+      )
+    );
+  }
+  for (const file of files || []) {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`,
+        'utf8'
+      )
+    );
+    chunks.push(file.buffer);
+    chunks.push(Buffer.from('\r\n', 'utf8'));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
+  const payload = Buffer.concat(chunks);
+  const target = new URL(urlString);
+  const lib = target.protocol === 'https:' ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = lib.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': payload.length,
+          Authorization: `Bearer ${token}`,
+        },
+      },
+      (res) => {
+        const parts = [];
+        res.on('data', (chunk) => parts.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(parts).toString('utf8');
+          let json = {};
+          if (text) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = {};
+            }
+          }
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const err = new Error(
+              `HTTP ${res.statusCode}: ${(json.message || text).slice(0, 200)}`
+            );
+            err.status = res.statusCode;
+            reject(err);
+            return;
+          }
+          resolve(Object.assign({}, json, { statusCode: res.statusCode }));
+        });
+      }
+    );
+    req.setTimeout(60000, () => {
       req.destroy(new Error('request timeout'));
     });
     req.on('error', reject);
@@ -933,6 +1061,15 @@ function onSecondTick() {
     }
   }
 
+  if (
+    activeSession?.screenshotsEnabled &&
+    nextScreenshotAt > 0 &&
+    now >= nextScreenshotAt
+  ) {
+    armScreenshotWindow(now);
+    captureActiveScreenshot().catch(() => undefined);
+  }
+
   if (cloudOffline) {
     if (!lastProbeAt || now - lastProbeAt >= ONLINE_PROBE_MS) {
       lastProbeAt = now;
@@ -979,9 +1116,208 @@ function armTicker() {
 
 let flushInFlight = null;
 
+function armScreenshotWindow(nowMs) {
+  if (!activeSession?.screenshotsEnabled) {
+    nextScreenshotAt = 0;
+    return;
+  }
+  const windowStart =
+    Math.floor(nowMs / SCREENSHOT_WINDOW_MS) * SCREENSHOT_WINDOW_MS;
+  let slot =
+    windowStart + Math.floor(Math.random() * SCREENSHOT_WINDOW_MS);
+  if (slot <= nowMs) {
+    slot =
+      windowStart +
+      SCREENSHOT_WINDOW_MS +
+      Math.floor(Math.random() * SCREENSHOT_WINDOW_MS);
+  }
+  nextScreenshotAt = slot;
+}
+
+async function captureActiveScreenshot() {
+  if (!activeSession?.screenshotsEnabled || !ledger) return;
+  if (screenshotCaptureInFlight || clockWritesBlocked || cloudOffline) return;
+  if (isUserIdle()) {
+    console.log('[screenshot] skipped — user idle');
+    return;
+  }
+
+  screenshotCaptureInFlight = true;
+  try {
+    const display = screen.getPrimaryDisplay();
+    const width = Math.min(Math.round(display.size.width * display.scaleFactor), 1920);
+    const height = Math.min(
+      Math.round(display.size.height * display.scaleFactor),
+      1080
+    );
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width, height },
+    });
+    const source =
+      sources.find((s) => String(s.display_id) === String(display.id)) ||
+      sources[0];
+    if (!source?.thumbnail || source.thumbnail.isEmpty()) {
+      console.warn('[screenshot] no screen source (grant Screen Recording?)');
+      return;
+    }
+
+    const fullImage = source.thumbnail.resize({
+      width: Math.min(source.thumbnail.getSize().width, 1600),
+      quality: 'better',
+    });
+    const thumbImage = source.thumbnail.resize({
+      width: 320,
+      quality: 'good',
+    });
+    const imageBuffer = fullImage.toJPEG(72);
+    const thumbBuffer = thumbImage.toJPEG(60);
+    if (!imageBuffer?.length || !thumbBuffer?.length) return;
+
+    const capturedAt = new Date(trustedNowMs() || Date.now()).toISOString();
+    const id = crypto.randomUUID();
+    const dir = ensureScreenshotDir();
+    const imagePath = path.join(dir, `${id}.jpg`);
+    const thumbPath = path.join(dir, `${id}-thumb.jpg`);
+    fs.writeFileSync(imagePath, imageBuffer);
+    fs.writeFileSync(thumbPath, thumbBuffer);
+
+    const machineId = getMachineId();
+    if (!machineId) return;
+    const imageSha = crypto.createHash('sha256').update(imageBuffer).digest('hex');
+    const thumbSha = crypto.createHash('sha256').update(thumbBuffer).digest('hex');
+    const meta = {
+      captured_at: capturedAt,
+      activity_level: 'active',
+      image_sha256: imageSha,
+      thumb_sha256: thumbSha,
+    };
+    const signature = signScreenshot(
+      activeSession.sessionId,
+      machineId,
+      meta,
+      activeSession.signingKey
+    );
+    if (!signature) return;
+
+    ledger.saveScreenshot(activeSession.sessionId, {
+      id,
+      captured_at: capturedAt,
+      activity_level: 'active',
+      imagePath,
+      thumbPath,
+      image_sha256: imageSha,
+      thumb_sha256: thumbSha,
+      signature,
+    });
+    console.log('[screenshot] queued', capturedAt);
+  } catch (err) {
+    console.warn('[screenshot] capture failed:', err.message);
+  } finally {
+    screenshotCaptureInFlight = false;
+  }
+}
+
+async function uploadLedgerScreenshots() {
+  if (!activeSession || !ledger || cloudOffline) return;
+  if (!activeSession.screenshotsEnabled) return;
+  const sessionId = activeSession.sessionId;
+  const rows = ledger.listScreenshots(sessionId) || [];
+  const machineId = getMachineId();
+  if (!machineId) return;
+
+  for (const row of rows) {
+    if (!activeSession || cloudOffline) return;
+    if (row.unreadable) {
+      ledger.deleteScreenshots(sessionId, [row.id]);
+      continue;
+    }
+    let imageBuffer;
+    let thumbBuffer;
+    try {
+      imageBuffer = fs.readFileSync(row.imagePath);
+      thumbBuffer = fs.readFileSync(row.thumbPath);
+    } catch (err) {
+      console.warn('[screenshot] missing file, dropping:', err.message);
+      ledger.deleteScreenshots(sessionId, [row.id]);
+      continue;
+    }
+
+    const meta = {
+      captured_at: row.captured_at,
+      activity_level: row.activity_level || 'active',
+      image_sha256: row.image_sha256,
+      thumb_sha256: row.thumb_sha256,
+    };
+    const signature =
+      row.signature ||
+      signScreenshot(sessionId, machineId, meta, activeSession.signingKey);
+    if (!signature) return;
+
+    try {
+      const buildHash = await getBuildHash();
+      await withAuthRetry(() =>
+        postMultipart(
+          apiUrl(
+            activeSession.apiBaseUrl,
+            `/time-tracking/sessions/${sessionId}/screenshots`
+          ),
+          activeSession.token,
+          {
+            captured_at: meta.captured_at,
+            activity_level: meta.activity_level,
+            machineId,
+            signature,
+            buildHash,
+          },
+          [
+            {
+              field: 'image',
+              filename: 'screenshot.jpg',
+              contentType: 'image/jpeg',
+              buffer: imageBuffer,
+            },
+            {
+              field: 'thumbnail',
+              filename: 'thumbnail.jpg',
+              contentType: 'image/jpeg',
+              buffer: thumbBuffer,
+            },
+          ]
+        )
+      );
+      try {
+        fs.unlinkSync(row.imagePath);
+      } catch {
+        // ignore
+      }
+      try {
+        fs.unlinkSync(row.thumbPath);
+      } catch {
+        // ignore
+      }
+      ledger.deleteScreenshots(sessionId, [row.id]);
+    } catch (err) {
+      if (isNetworkError(err)) {
+        markOffline(err);
+        return;
+      }
+      if (isSessionGoneError(err)) {
+        clearLocalSession('Screenshot upload: session closed on server');
+        return;
+      }
+      console.error('[screenshot] upload failed:', err.message);
+      return;
+    }
+  }
+}
+
 async function flushTicks() {
   if (flushInFlight) return flushInFlight;
-  flushInFlight = uploadLedgerMinutes().finally(() => {
+  flushInFlight = (async () => {
+    await uploadLedgerMinutes();
+    await uploadLedgerScreenshots();
+  })().finally(() => {
     flushInFlight = null;
   });
   return flushInFlight;
@@ -1186,6 +1522,7 @@ function startMonitoring() {
     sendHeartbeat().catch(() => undefined);
     refreshSessionToken().catch(() => undefined);
   }
+  if (now) armScreenshotWindow(now);
   startInputPoll();
   armTicker();
   preventAppNap();
@@ -1250,6 +1587,7 @@ async function startSession(payload) {
       Number(payload.idleThresholdSec) || 600
     ),
     signingKey: signingKey.toLowerCase(),
+    screenshotsEnabled: payload.screenshotsEnabled === true,
   };
 
   // Same session already running (e.g. after quit/resume) — refresh creds, stay up
@@ -1266,7 +1604,10 @@ async function startSession(payload) {
     const previousId = activeSession.sessionId;
     stopMonitoringTimers();
     activeSession = null;
-    if (ledger) ledger.clearMinutes(previousId);
+    if (ledger) {
+      ledger.clearMinutes(previousId);
+      ledger.clearScreenshots(previousId);
+    }
     saveSessionMarker();
   }
 
@@ -1830,6 +2171,7 @@ app.whenReady().then(async () => {
         Number(marker.idleThresholdSec) || 600
       ),
       signingKey: String(marker.signingKey || ''),
+      screenshotsEnabled: marker.screenshotsEnabled === true,
     };
     console.log('Resuming active session', activeSession.sessionId);
     beginClockHold();

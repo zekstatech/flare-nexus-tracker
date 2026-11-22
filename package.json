@@ -1,6 +1,6 @@
 {
   "name": "flare-nexus-tracker",
-  "version": "0.1.13",
+  "version": "0.2.0",
   "description": "Flare desktop productivity app",
   "main": "main.js",
   "private": true,

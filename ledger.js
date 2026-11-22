@@ -69,6 +69,14 @@ function migrateLegacy(db, key) {
       sealed TEXT NOT NULL,
       PRIMARY KEY (session_id, minute_ts)
     );
+    CREATE TABLE IF NOT EXISTS screenshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      sealed TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_screenshots_session
+      ON screenshots (session_id, captured_at);
   `);
 
   const insertSession = db.prepare(`
@@ -125,6 +133,16 @@ function openLedger(file, key) {
   db.pragma('temp_store = MEMORY');
   db.pragma('mmap_size = 268435456');
   migrateLegacy(db, key);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS screenshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      sealed TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_screenshots_session
+      ON screenshots (session_id, captured_at);
+  `);
 
   const saveSessionStmt = db.prepare(`
     INSERT INTO session (id, session_id, sealed)
@@ -158,6 +176,29 @@ function openLedger(file, key) {
   const deleteSome = db.transaction((sessionId, minuteTsList) => {
     for (const minuteTs of minuteTsList) deleteOneStmt.run(sessionId, minuteTs);
   });
+  const saveScreenshotStmt = db.prepare(`
+    INSERT INTO screenshots (id, session_id, captured_at, sealed)
+    VALUES (@id, @sessionId, @captured_at, @sealed)
+    ON CONFLICT(id) DO UPDATE SET
+      session_id = excluded.session_id,
+      captured_at = excluded.captured_at,
+      sealed = excluded.sealed
+  `);
+  const listScreenshotsStmt = db.prepare(`
+    SELECT id, sealed
+    FROM screenshots
+    WHERE session_id = ?
+    ORDER BY captured_at
+  `);
+  const deleteOneScreenshotStmt = db.prepare(
+    'DELETE FROM screenshots WHERE session_id = ? AND id = ?'
+  );
+  const deleteSessionScreenshotsStmt = db.prepare(
+    'DELETE FROM screenshots WHERE session_id = ?'
+  );
+  const deleteSomeScreenshots = db.transaction((sessionId, idList) => {
+    for (const id of idList) deleteOneScreenshotStmt.run(sessionId, id);
+  });
 
   return {
     saveSession(session) {
@@ -166,8 +207,9 @@ function openLedger(file, key) {
         sealed: sealJson(key, {
           token: String(session.token),
           apiBaseUrl: String(session.apiBaseUrl),
-          idleThresholdSec: Number(session.idleThresholdSec) || 300,
+          idleThresholdSec: Number(session.idleThresholdSec) || 600,
           signingKey: String(session.signingKey || ''),
+          screenshotsEnabled: session.screenshotsEnabled === true,
         }),
       });
     },
@@ -182,6 +224,7 @@ function openLedger(file, key) {
           apiBaseUrl: body.apiBaseUrl,
           idleThresholdSec: body.idleThresholdSec,
           signingKey: body.signingKey || '',
+          screenshotsEnabled: body.screenshotsEnabled === true,
         };
       } catch (err) {
         console.warn('[ledger] session seal failed:', err.message);
@@ -226,6 +269,40 @@ function openLedger(file, key) {
     },
     clearMinutes(sessionId) {
       deleteSessionMinutesStmt.run(String(sessionId));
+    },
+    saveScreenshot(sessionId, entry) {
+      const id = String(entry.id);
+      saveScreenshotStmt.run({
+        id,
+        sessionId: String(sessionId),
+        captured_at: String(entry.captured_at),
+        sealed: sealJson(key, {
+          id,
+          captured_at: String(entry.captured_at),
+          activity_level: entry.activity_level === 'idle' ? 'idle' : 'active',
+          imagePath: String(entry.imagePath || ''),
+          thumbPath: String(entry.thumbPath || ''),
+          image_sha256: String(entry.image_sha256 || ''),
+          thumb_sha256: String(entry.thumb_sha256 || ''),
+          signature: String(entry.signature || ''),
+        }),
+      });
+    },
+    listScreenshots(sessionId) {
+      return listScreenshotsStmt.all(String(sessionId)).map((row) => {
+        try {
+          return openJson(key, row.sealed);
+        } catch {
+          return { id: row.id, unreadable: true };
+        }
+      });
+    },
+    deleteScreenshots(sessionId, idList) {
+      if (!idList || idList.length === 0) return;
+      deleteSomeScreenshots(String(sessionId), idList);
+    },
+    clearScreenshots(sessionId) {
+      deleteSessionScreenshotsStmt.run(String(sessionId));
     },
     close() {
       db.close();

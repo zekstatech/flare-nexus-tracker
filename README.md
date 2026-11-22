@@ -22,7 +22,8 @@ Pairs with the HRMS time-tracking module (`flare-human-nexus` → `plans/time-tr
 - Sleep/wake clock hold always releases (15s timeout); unlock-screen does not stall recording
 - Persists an active-session marker and **auto-resumes** after reboot / relaunch
 - Validates resumed session against the API (clears marker if server already closed it)
-- No screenshots in MVP
+- Phase 2: optional active-only screenshots (org toggle), offline queue, multipart upload to HRMS → S3
+- macOS Screen Recording permission required when screenshots are enabled
 
 ## Use cases (installed app)
 
