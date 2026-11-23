@@ -1,6 +1,6 @@
 {
   "name": "flare-nexus-tracker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Flare desktop productivity app",
   "main": "main.js",
   "private": true,
@@ -11,6 +11,7 @@
   },
   "scripts": {
     "postinstall": "electron-builder install-app-deps",
+    "test": "node --test handshake.test.js",
     "start": "electron .",
     "dev": "electron .",
     "dist": "electron-builder --mac --win --linux",
@@ -34,6 +35,7 @@
     "files": [
       "main.js",
       "ledger.js",
+      "handshake.js",
       "buildHash.js",
       "package.json"
     ],

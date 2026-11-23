@@ -65,13 +65,13 @@ npm run dist:linux    # → release/Productivity-App-linux.AppImage
 
 You do **not** create the release by hand in the GitHub UI for each ship.
 
-1. Bump `"version"` in `package.json` (e.g. `0.1.4`)
+1. Bump `"version"` in `package.json` (e.g. `0.2.1`)
 2. Commit + push `main`
 3. Tag and push the same version:
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 CI builds mac/win/linux and publishes a **non-draft** Release. When Actions is green:
@@ -81,6 +81,20 @@ CI builds mac/win/linux and publishes a **non-draft** Release. When Actions is g
 - https://github.com/zekstatech/flare-nexus-tracker/releases/latest/download/Productivity-App-linux.AppImage
 
 If the repo is **private**, unauthenticated `/latest/download/...` returns **404**. Make the repo (or at least release assets) public for employee downloads and auto-update.
+
+### Backend allowlist (required when `PRODUCTIVITY_AGENT_ASAR_SHA256` is set)
+
+Each release CI attaches `*-build-hash.txt` assets (SHA-256 of `app.asar` + unpacked native addons). After the Release is published:
+
+1. Open the release assets and copy every hex digest (mac arm64/x64, win, linux — all of them).
+2. Set backend env to a comma-separated list, **including previous digests you still want to accept** during rollout:
+
+```bash
+PRODUCTIVITY_AGENT_ASAR_SHA256=<mac>,<win>,<linux>
+```
+
+3. Redeploy/restart the API. Until the new hashes are listed, auto-updated agents get `BUILD_HASH_INVALID` and check-in fails.
+4. Keep `PRODUCTIVITY_HANDSHAKE_PRIVATE_KEY` as the Ed25519 private key matching the public key embedded in the agent. Rotating it requires a new agent build.
 
 Install UI in HRMS: `/tracker-install`
 

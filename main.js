@@ -22,7 +22,8 @@
  * POST /start, /stop, and /preflight require a single-use handshake
  * token signed by the HRMS API. /status stays open for the install check.
  * The window is static — hidden renderers throttle timers.
- * Phase 2: optional active-only screenshots (org toggle), queued offline,
+ * Phase 2: optional active-only screenshots (org toggle), random 5–15 min
+ * spacing (unpredictable), queued offline,
  * uploaded as multipart JPEG + thumbnail.
  */
 
@@ -48,6 +49,7 @@ const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
 const { openLedger } = require('./ledger');
+const { createHandshakeConsumer } = require('./handshake');
 const { hashResources, hashDevSources } = require('./buildHash');
 
 const AGENT_PORT = Number(process.env.TRACKER_AGENT_PORT || 17345);
@@ -72,8 +74,16 @@ const UPLOAD_CHUNK = 120;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 /** Never leave the ticker blocked waiting on the API. */
 const CLOCK_HOLD_MAX_MS = 15 * 1000;
-/** One random capture inside each 10-minute window when screenshots are on. */
-const SCREENSHOT_WINDOW_MS = 10 * 60 * 1000;
+/**
+ * Unpredictable capture spacing while screenshots are on.
+ * Next shot is a uniform random delay in [MIN, MAX] after the last attempt
+ * (wall-clock windows are intentionally avoided so timing cannot be guessed).
+ */
+const SCREENSHOT_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const SCREENSHOT_MAX_INTERVAL_MS = 15 * 60 * 1000;
+/** If due while idle, retry after a short random delay instead of skipping the period. */
+const SCREENSHOT_IDLE_RETRY_MIN_MS = 30 * 1000;
+const SCREENSHOT_IDLE_RETRY_MAX_MS = 90 * 1000;
 
 let buildHashPromise = null;
 
@@ -326,68 +336,14 @@ function saveBucket(bucket) {
   saveMinuteTick(minuteTick(bucket, minuteIsActive(bucket)));
 }
 
-const HANDSHAKE_TTL_SEC = 60;
-const HANDSHAKE_SKEW_SEC = 30;
-/** nonce -> expiry unix seconds. Replay of a captured token is rejected. */
-const usedHandshakes = new Map();
-
-/**
- * Same token format as backend/src/utils/agentHandshake.js.
- * Returns { n, exp } or null.
- */
-function verifyHandshake(action, token, nowMs = Date.now()) {
-  const tokenStr = String(token || '');
-  const dot = tokenStr.lastIndexOf('.');
-  if (dot <= 0) return null;
-  const payload = tokenStr.slice(0, dot);
-  const sig = tokenStr.slice(dot + 1);
-  if (!sig) return null;
-  let authentic = false;
-  try {
-    authentic = crypto.verify(
-      null,
-      Buffer.from(`agent-handshake.${payload}`),
-      HANDSHAKE_PUBLIC_KEY,
-      Buffer.from(sig, 'base64url')
-    );
-  } catch {
-    return null;
-  }
-  if (!authentic) return null;
-
-  let body;
-  try {
-    body = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-  if (!body || body.act !== action) return null;
-  if (typeof body.n !== 'string' || !/^[0-9a-f]{32}$/.test(body.n)) return null;
-  const exp = Number(body.exp);
-  const now = Math.floor(nowMs / 1000);
-  const serverMs = Number(body.t);
-  const serverSec = Number.isFinite(serverMs) ? Math.floor(serverMs / 1000) : null;
-  if (!Number.isFinite(exp)) return null;
-  // A shifted laptop clock must not expire a freshly signed token.
-  const clockForExpiry =
-    serverSec != null && Math.abs(now - serverSec) > 5 * 60 ? serverSec : now;
-  if (clockForExpiry > exp + HANDSHAKE_SKEW_SEC) return null;
-  if (exp - clockForExpiry > HANDSHAKE_TTL_SEC + HANDSHAKE_SKEW_SEC) return null;
-  return { n: body.n, exp, t: Number.isFinite(serverMs) ? serverMs : null };
-}
-
-function consumeHandshake(action, token) {
-  const parsed = verifyHandshake(action, token);
-  if (!parsed) return null;
-  if (parsed.t) anchorTrustedClock(parsed.t);
-  const now = Math.floor(Date.now() / 1000);
-  for (const [nonce, exp] of usedHandshakes) {
-    if (exp + HANDSHAKE_SKEW_SEC < now) usedHandshakes.delete(nonce);
-  }
-  if (usedHandshakes.has(parsed.n)) return false;
-  usedHandshakes.set(parsed.n, parsed.exp);
-  return true;
-}
+/** Single-use handshake; skew-tolerant until a server clock is anchored. */
+const consumeHandshake = createHandshakeConsumer({
+  publicKey: HANDSHAKE_PUBLIC_KEY,
+  getTrustedMs: () => trustedNowMs(),
+  onAnchor: (serverNowMs) => {
+    anchorTrustedClock(serverNowMs);
+  },
+});
 
 function statOrNull(value) {
   if (value == null || value === '') return null;
@@ -1066,8 +1022,13 @@ function onSecondTick() {
     nextScreenshotAt > 0 &&
     now >= nextScreenshotAt
   ) {
-    armScreenshotWindow(now);
-    captureActiveScreenshot().catch(() => undefined);
+    if (isUserIdle()) {
+      // Stay unpredictable: short jittered retry, don't burn a full interval while idle.
+      scheduleScreenshotRetry(now);
+    } else {
+      scheduleNextScreenshot(now);
+      captureActiveScreenshot().catch(() => undefined);
+    }
   }
 
   if (cloudOffline) {
@@ -1116,22 +1077,31 @@ function armTicker() {
 
 let flushInFlight = null;
 
-function armScreenshotWindow(nowMs) {
+function randomBetweenMs(minMs, maxMs) {
+  const lo = Math.max(0, Math.floor(minMs));
+  const hi = Math.max(lo, Math.floor(maxMs));
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/** Schedule the next capture at an unpredictable offset from now. */
+function scheduleNextScreenshot(nowMs) {
   if (!activeSession?.screenshotsEnabled) {
     nextScreenshotAt = 0;
     return;
   }
-  const windowStart =
-    Math.floor(nowMs / SCREENSHOT_WINDOW_MS) * SCREENSHOT_WINDOW_MS;
-  let slot =
-    windowStart + Math.floor(Math.random() * SCREENSHOT_WINDOW_MS);
-  if (slot <= nowMs) {
-    slot =
-      windowStart +
-      SCREENSHOT_WINDOW_MS +
-      Math.floor(Math.random() * SCREENSHOT_WINDOW_MS);
+  nextScreenshotAt =
+    nowMs +
+    randomBetweenMs(SCREENSHOT_MIN_INTERVAL_MS, SCREENSHOT_MAX_INTERVAL_MS);
+}
+
+function scheduleScreenshotRetry(nowMs) {
+  if (!activeSession?.screenshotsEnabled) {
+    nextScreenshotAt = 0;
+    return;
   }
-  nextScreenshotAt = slot;
+  nextScreenshotAt =
+    nowMs +
+    randomBetweenMs(SCREENSHOT_IDLE_RETRY_MIN_MS, SCREENSHOT_IDLE_RETRY_MAX_MS);
 }
 
 async function captureActiveScreenshot() {
@@ -1252,7 +1222,12 @@ async function uploadLedgerScreenshots() {
     const signature =
       row.signature ||
       signScreenshot(sessionId, machineId, meta, activeSession.signingKey);
-    if (!signature) return;
+    if (!signature) {
+      console.warn('[screenshot] missing signature, dropping row', row.id);
+      dropScreenshotFiles(row);
+      ledger.deleteScreenshots(sessionId, [row.id]);
+      continue;
+    }
 
     try {
       const buildHash = await getBuildHash();
@@ -1286,16 +1261,7 @@ async function uploadLedgerScreenshots() {
           ]
         )
       );
-      try {
-        fs.unlinkSync(row.imagePath);
-      } catch {
-        // ignore
-      }
-      try {
-        fs.unlinkSync(row.thumbPath);
-      } catch {
-        // ignore
-      }
+      dropScreenshotFiles(row);
       ledger.deleteScreenshots(sessionId, [row.id]);
     } catch (err) {
       if (isNetworkError(err)) {
@@ -1306,9 +1272,33 @@ async function uploadLedgerScreenshots() {
         clearLocalSession('Screenshot upload: session closed on server');
         return;
       }
-      console.error('[screenshot] upload failed:', err.message);
+      // One bad row (413/403/400/…) must not stall the rest of the queue.
+      const status = Number(err.status);
+      if (status === 400 || status === 403 || status === 413 || status === 422) {
+        console.error('[screenshot] dropping failed upload:', err.message);
+        dropScreenshotFiles(row);
+        ledger.deleteScreenshots(sessionId, [row.id]);
+        if (status === 403) {
+          activeSession.screenshotsEnabled = false;
+        }
+        continue;
+      }
+      console.error('[screenshot] upload failed, will retry:', err.message);
       return;
     }
+  }
+}
+
+function dropScreenshotFiles(row) {
+  try {
+    if (row?.imagePath) fs.unlinkSync(row.imagePath);
+  } catch {
+    // ignore
+  }
+  try {
+    if (row?.thumbPath) fs.unlinkSync(row.thumbPath);
+  } catch {
+    // ignore
   }
 }
 
@@ -1522,7 +1512,7 @@ function startMonitoring() {
     sendHeartbeat().catch(() => undefined);
     refreshSessionToken().catch(() => undefined);
   }
-  if (now) armScreenshotWindow(now);
+  if (now) scheduleNextScreenshot(now);
   startInputPoll();
   armTicker();
   preventAppNap();
